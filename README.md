@@ -17,6 +17,8 @@ movie-pipeline/
 ├── etl.py                the pipeline (extract, transform, load, enrich)
 ├── schema.sql            CREATE TABLE statements
 ├── queries.sql           the four analytical queries
+├── check_coverage.py     reports how many movies/ratings are enriched
+├── run_queries.py        runs queries.sql and prints the results
 ├── requirements.txt
 └── README.md
 ```
@@ -125,18 +127,16 @@ movies (movie_id PK, title, release_year, decade, imdb_id, plot, box_office, omd
 | Movies loaded | 9,742 |
 | Ratings loaded | 100,836 (none dropped) |
 | Genres | 19 |
-| Movies enriched from OMDb | 970 (10.0%) |
+| Movies enriched from OMDb | 998 (10.2%) |
 | Not found / errors | 0 / 0 |
-| **Share of all ratings covered by enriched movies** | **59.9%** |
-
-> TODO: re-run `python check_coverage.py` after more daily runs and update these numbers (including the Q3 answer below).
+| **Share of all ratings covered by enriched movies** | **60.6%** |
 
 **Query answers** (see `queries.sql`):
 
 1. **Highest average rating:** *The Shawshank Redemption*, 4.43 average from 317 ratings (minimum 50 ratings required).
 2. **Top 5 genres by average rating:** Film-Noir (3.92), War (3.81), Documentary (3.80), Crime (3.66), Drama (3.66). Smaller genres like Film-Noir have fewer ratings (870) than Drama (41,928), so their averages are less certain.
-3. **Director with the most movies:** Steven Spielberg (17 movies). This is **provisional**: it is computed only from the 970 enriched movies and may change as enrichment continues.
-4. **Average rating per release year:** see the output of the fourth query in `queries.sql`.
+3. **Director with the most movies:** Steven Spielberg (17 movies). This is **provisional**: it is computed only from the 998 enriched movies and may change as enrichment continues.
+4. **Average rating per release year:** one row per year, starting in 1902. Early years have very few ratings (for example 1902 has 5 and 1917 has 1), so those averages are noisy, which is why `num_ratings` is shown.
 
 Queries 1, 2 and 4 use only the CSV data, which is 100% loaded, so they are unaffected by API coverage.
 
