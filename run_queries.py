@@ -6,5 +6,5 @@ for query in [q.strip() for q in sql.split(";") if q.strip()]:
     cur = conn.execute(query)
     print("\n" + query.splitlines()[0])
     print([d[0] for d in cur.description])
-    for row in cur.fetchall()[:10]:
+    for row in cur.fetchall():
         print(row)

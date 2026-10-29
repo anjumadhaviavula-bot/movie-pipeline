@@ -1,23 +1,31 @@
 # Movie Data Pipeline
 
-A small ETL pipeline that combines the **MovieLens "small" dataset** (movies and ratings CSVs) with details from the **OMDb API** (director, plot, box office). It cleans and transforms the data and loads it idempotently into a normalized **SQLite** database, then answers analytical questions with SQL.
+## Overview
+
+This project is a small ETL pipeline built around two files from the MovieLens "small" dataset, `movies.csv` and `ratings.csv`. For each movie it also pulls extra details from the OMDb API (director, plot and box office), cleans everything up, and loads it into a SQLite database. Once the data is in, four SQL queries answer the analytical questions from the assignment.
 
 ```
 movies.csv ──┐
 ratings.csv ─┼─► Extract ─► Transform ─► Load ─► SQLite (movies.db) ─► queries.sql
-links.csv ───┤   (read CSVs,   (clean, parse,    (upserts, one
-OMDb API ────┘    call API)      enrich)           transaction)
+OMDb API ────┘   (read CSVs,   (clean, parse,    (upserts, one
+                  call API)      enrich)           transaction)
 ```
+
+A few things I cared about while building it:
+
+- **It can be re-run safely.** Running `etl.py` twice gives you the same database, not duplicate rows.
+- **It works within the free API limit.** OMDb's free key allows about 1,000 requests a day, so the pipeline remembers where it stopped and picks up from there the next day.
+- **It prefers no answer over a wrong answer.** If a movie can't be matched on OMDb with confidence, it's marked as not found rather than linked to the wrong film.
 
 ## Repository structure
 
 ```
 movie-pipeline/
-├── data/                 MovieLens CSVs (movies.csv, ratings.csv, links.csv)
+├── data/                 MovieLens CSVs (movies.csv, ratings.csv)
 ├── etl.py                the pipeline (extract, transform, load, enrich)
 ├── schema.sql            CREATE TABLE statements
 ├── queries.sql           the four analytical queries
-├── check_coverage.py     reports how many movies/ratings are enriched
+├── check_coverage.py     shows how many movies/ratings are enriched so far
 ├── run_queries.py        runs queries.sql and prints the results
 ├── requirements.txt
 └── README.md
@@ -25,10 +33,10 @@ movie-pipeline/
 
 ## Setup and run
 
-**Requirements:** Python 3.8+ and a free OMDb API key (https://www.omdbapi.com/apikey.aspx; remember to click the activation link in the email).
+You'll need Python 3.8 or newer and a free OMDb API key from https://www.omdbapi.com/apikey.aspx. One thing that tripped me up: the key only works after you click the activation link OMDb sends by email.
 
 ```bash
-# 1. Clone and enter the project
+# 1. Clone the repo
 git clone https://github.com/anjumadhaviavula-bot/movie-pipeline.git
 cd movie-pipeline
 
@@ -40,112 +48,126 @@ venv\Scripts\activate            # Windows PowerShell
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Add your API key (create a file named .env in the project root)
+# 4. Create a file called .env in the project root with your key
 OMDB_API_KEY=your_key_here
 
-# 5. Make sure data/ contains movies.csv, ratings.csv and links.csv
-#    (MovieLens "ml-latest-small": https://grouplens.org/datasets/movielens/latest/)
+# 5. Check that data/ has movies.csv and ratings.csv
+#    (they come from MovieLens "ml-latest-small":
+#     https://grouplens.org/datasets/movielens/latest/; only these two files are used)
 
 # 6. Run the pipeline
-python etl.py --skip-api         # load CSV data only
-python etl.py --limit 20         # quick test with 20 API calls
-python etl.py                    # full run; resumes where it stopped
+python etl.py --skip-api         # load the CSV data only, no API calls
+python etl.py --limit 20         # quick test with 20 movies
+python etl.py                    # full run; continues where the last run stopped
+python etl.py --retry-not-found  # give movies OMDb didn't match another try
 ```
 
-The database file `movies.db` is created automatically. To run the analytical queries, open it with any SQLite tool (for example DB Browser for SQLite) and run `queries.sql`, or use the `sqlite3` command line:
+`movies.db` is created automatically on the first run. To see the answers to all four questions, run:
 
 ```bash
-sqlite3 movies.db < queries.sql
+python run_queries.py
 ```
 
-**Note on the OMDb free tier:** the free key allows roughly 1,000 requests per day, and there are 9,742 movies. The pipeline is therefore **resumable**: run `python etl.py` once a day and it continues with the movies that are still pending.
+or open `movies.db` in any SQLite tool (DB Browser for SQLite works well) and run `queries.sql`, or use `sqlite3 movies.db < queries.sql`.
 
-## Data model
-
-Genres and directors are many-to-many relationships (a movie has several genres; a director can direct several movies), so each has its own table plus a junction table. Composite primary keys prevent duplicate rows.
-
-```
-movies (movie_id PK, title, release_year, decade, imdb_id, plot, box_office, omdb_status)
-   │
-   ├── movie_genres (movie_id, genre_id)  ── genres (genre_id PK, name UNIQUE)
-   ├── movie_directors (movie_id, director_id) ── directors (director_id PK, name UNIQUE)
-   └── ratings (user_id, movie_id) PK, rating, rated_at)
-```
-
-| Table | Purpose |
-|---|---|
-| `movies` | One row per movie: cleaned title, release year, decade, plus OMDb details |
-| `genres`, `movie_genres` | Normalized genre list (the `Action\|Comedy` string is split) |
-| `directors`, `movie_directors` | Normalized director list (OMDb returns `"A, B"` strings) |
-| `ratings` | One row per user rating; primary key `(user_id, movie_id)` |
-
-`movies.omdb_status` records the API outcome (`pending`, `found`, `not_found`, `error`), which is what makes enrichment resumable and auditable.
+**About the API limit:** there are 9,742 movies and the free key allows roughly 1,000 requests a day, so a full enrichment takes several days. Just run `python etl.py` once a day and it carries on with the movies that are still pending. `python check_coverage.py` shows how far along it is.
 
 ## How the pipeline works
 
 **Extract**
-- Reads `movies.csv`, `ratings.csv` and `links.csv` with pandas.
-- Calls the OMDb API for each movie, in this order: by **IMDb ID** (from `links.csv`, an exact match), then by **title + year**, then by **title alone**.
-- Retries network failures with exponential backoff (1s, 2s, 4s) and stops cleanly when the daily request limit is reached.
+- Reads `movies.csv` and `ratings.csv` with pandas. Nothing else from MovieLens is used.
+- Looks up each movie on OMDb by its cleaned title and release year. Matching turned out to be the trickiest part of the project, so it has its own section under challenges below.
+- If a request fails because of a network problem, it waits and retries (1s, 2s, then 4s). When the daily limit is reached, it saves its progress and stops with a clear message.
 
 **Transform**
-- Splits the release year out of the title (`Toy Story (1995)` becomes `Toy Story` and `1995`).
-- Fixes titles with moved articles (`Usual Suspects, The` becomes `The Usual Suspects`) and strips alternate titles in parentheses, so API title lookups succeed.
-- Converts Unix timestamps to datetimes, drops duplicate and out-of-range ratings, and removes ratings for unknown movies.
-- Converts OMDb's `"N/A"` strings to `NULL`, parses box office (`"$229,947,062"` becomes `229947062`), and splits multi-director strings.
-- **Feature engineering:** genres are split into a normalized table, and a `decade` column is derived from the release year.
+- Splits the year out of the title, so `Toy Story (1995)` becomes `Toy Story` and `1995`.
+- Puts titles back in their natural order (`Usual Suspects, The` becomes `The Usual Suspects`) so the API can find them.
+- Converts the Unix timestamps in the ratings to readable dates, and checks for duplicate ratings, ratings outside 0.5 to 5, and ratings for movies that don't exist. The dataset turned out to be clean, so nothing had to be dropped.
+- Cleans up what OMDb sends back: `"N/A"` becomes `NULL`, box office strings like `"$229,947,062"` become numbers, and `"Director A, Director B"` is split into two directors.
+- Feature engineering: the pipe-separated genres (`Action|Comedy`) are split into their own table, and a `decade` column is added from the release year.
 
 **Load**
-- **Idempotent:** every load uses primary keys with `INSERT ... ON CONFLICT DO UPDATE` or `INSERT OR IGNORE`, so running the script repeatedly never creates duplicates. I verified this by running it twice and comparing row counts for every table.
-- The CSV data is loaded in a single transaction, so a failure rolls back cleanly.
-- API progress is committed every 50 movies.
+- Every insert is keyed on a primary key (`INSERT ... ON CONFLICT DO UPDATE` or `INSERT OR IGNORE`), so the script can be run as many times as you like without creating duplicates. I checked this by running it twice and comparing the row counts of every table.
+- The CSV data is loaded in a single transaction, so if something fails halfway, nothing half-finished is left behind.
+- API results are saved every 50 movies, so an interrupted run loses very little work.
 
 ## Design choices and assumptions
 
-- **SQLite:** zero setup, so reviewers can run the project immediately. The SQL is standard, and moving to PostgreSQL would need only small changes.
-- **Normalized schema:** avoids storing delimited strings in a column and makes genre and director queries simple joins.
-- **IMDb ID matching:** `links.csv` (part of the same MovieLens download) maps each movie to its IMDb ID. This gives exact API lookups instead of fuzzy title matching. Title and year are used only as a fallback.
-- **Movies are never dropped:** if the API can't find a movie, it stays in the database with `omdb_status = 'not_found'`, because its ratings are still valid.
-- **Most-rated movies are enriched first:** because of the API limit, movies are processed in descending order of rating count, so a partial run covers the data that matters most.
-- **Q1 uses a minimum of 50 ratings:** otherwise a movie with a single 5-star rating would win. This is an assumption, and the threshold is easy to change in `queries.sql`.
-- **Ratings keep the latest value** if a (user, movie) pair appears twice (it doesn't in this dataset).
+- **SQLite.** It needs no installation or server, so anyone reviewing this can run it right away. The SQL is standard, so moving to PostgreSQL later would be a small change.
+- **Separate tables for genres and directors.** A movie can have several genres and several directors, so storing them as comma-separated text would make the queries messy. With their own tables, "top genres" and "top director" are simple joins.
+- **Only the two required files.** The assignment asks for `movies.csv` and `ratings.csv`, so those are the only inputs (plus the OMDb API). The `imdb_id` column is filled in from OMDb's response.
+- **No movie is ever dropped.** If OMDb can't find a movie, it stays in the database with `omdb_status = 'not_found'`. Its ratings are still real, so they still count in the queries.
+- **Most-rated movies go to the API first.** Since only about 1,000 requests fit in a day, it made sense to start with the movies people actually rated the most. That way even a partial run covers most of the ratings.
+- **Q1 needs at least 50 ratings.** Without a minimum, some movie with a single 5-star rating would come out on top, which isn't a meaningful answer. 50 is my judgement call, and it's easy to change in `queries.sql`.
+- **Genre averages are taken over individual ratings.** In question 2, a movie with many ratings counts more towards its genre than a movie with only a few. I think that reflects what viewers actually rated, but averaging per movie first would be a valid alternative and would give slightly different numbers.
+- **Duplicate ratings keep the latest value.** If the same user rated the same movie twice, the newer rating (by timestamp) wins. This never actually happens in this dataset, but the pipeline handles it anyway.
 
 ## Challenges and how I solved them
 
-1. **API daily limit (about 1,000 requests/day vs 9,742 movies).** I made enrichment resumable using the `omdb_status` column, ordered by rating count so partial runs are still valuable, and made the script stop cleanly with a clear message when the limit is hit.
-2. **Matching movies between MovieLens and OMDb.** MovieLens titles embed the year, move articles to the end, and sometimes include alternate titles. I added title cleaning, but the bigger win was using IMDb IDs from `links.csv`: in my runs, **all enriched movies were matched with 0 not-found and 0 errors**. The title-based fallback remains for movies with no IMDb link.
-3. **Messy API values.** OMDb returns the string `"N/A"` for missing fields, currency strings for box office, and comma-separated directors. These are converted to `NULL`, integers, and separate rows respectively.
-4. **Idempotency.** Plain `INSERT` or `to_sql(append)` would duplicate rows on every run. Primary keys plus upserts solved this, and the enrichment step touches only movies still pending.
-5. **Type issues when loading.** pandas and numpy types can't be bound directly by SQLite, so values are converted to plain Python types before inserting.
+**1. The API's daily limit.** About 1,000 requests a day against 9,742 movies meant the enrichment could never finish in one go. I added an `omdb_status` column (`pending`, `found`, `not_found`, `error`) so each run knows exactly what's left to do. I also process the most-rated movies first, so a partial result is still useful, and when the limit is hit the script saves its progress and exits cleanly instead of crashing.
+
+**2. Finding the right movie on OMDb (and handling movies that aren't found).** This was the biggest challenge. `movies.csv` has no ID that OMDb understands, so every lookup goes by title, and MovieLens titles often differ from OMDb's: `Usual Suspects, The`, `Boot, Das`, `Twelve Monkeys (a.k.a. 12 Monkeys)`, `Harold and Kumar` vs `Harold & Kumar`.
+
+My first version cleaned the title and asked OMDb for "this title, this year". Most movies were found, but some of the directors that came back made no sense. OMDb returns *a* movie with that title, not necessarily *the* movie: for *Schindler's List* (1993) it returned a little-known entry with the same name instead of Spielberg's film. OMDb also often lists the US release year (*Spirited Away*: 2001 in MovieLens, 2003 on OMDb).
+
+So I made the matching stricter:
+
+- **Try a few versions of the title:** the cleaned title, alternate titles from the brackets, `and`/`&` swaps, and shorter forms (`Romeo + Juliet` for `William Shakespeare's Romeo + Juliet`).
+- **Check every answer before accepting it:** the title must match (numbers too, so `Dr. Dolittle 2` is rejected), the year must be close (1 year earlier to 3 years later), and the film needs at least 1,000 IMDb votes, which filters out the lookalikes.
+- **If the quick lookup fails,** try the title without a year, then a search, picking the matching entry with the lowest IMDb ID, since the original film is usually the oldest entry.
+- **If nothing passes,** the movie is marked `not_found` and kept with its ratings. Temporary API errors are marked `error` and retried on the next run.
+
+In the current run, 2,114 of 2,136 movies were matched (99%). The rest are mostly titles that differ too much, like `Old Boy` vs `Oldboy`. I chose to leave those unmatched rather than loosen the rules, because a wrong director hurts the analysis more than a missing one.
+
+**3. Messy values from the API.** OMDb uses the text `"N/A"` for anything missing, sends box office as a currency string, and puts multiple directors in one comma-separated field. These are turned into `NULL`, plain numbers, and one row per director.
+
+**4. Re-running without duplicates.** A plain `INSERT` (or pandas `to_sql` in append mode) adds the same rows again on every run. Primary keys plus upserts fixed that, and the API step only touches movies that are still pending.
+
+**5. Data types when loading.** SQLite doesn't accept numpy types like `numpy.int64` directly, which caused errors at first. Converting the values to plain Python types before inserting solved it.
+
+**6. Developing against a rate-limited API.** Every test run used up part of the daily quota, and I ran out more than once while working on the matching. To get around this, I tested the title-cleaning and matching rules with small offline checks first, and only then tried them live on small batches with `--limit` before doing a full run. Re-running just the earlier misses with `--retry-not-found` also meant I didn't have to repeat the whole enrichment after each improvement.
+
+**7. Keeping the API key private.** The key lives in a `.env` file that is listed in `.gitignore`, so it never ends up in the repository. While adding error logging, I also noticed that logging the full request would have printed the key into the logs, so the log messages only show the movie being looked up, never the key.
 
 ## Results
 
-**Pipeline status (as of this README):**
+Status at the time of writing:
 
 | Metric | Value |
 |---|---|
 | Movies loaded | 9,742 |
 | Ratings loaded | 100,836 (none dropped) |
 | Genres | 19 |
-| Movies enriched from OMDb | 998 (10.2%) |
-| Not found / errors | 0 / 0 |
-| **Share of all ratings covered by enriched movies** | **60.6%** |
+| Movies sent to OMDb so far | 2,136 (most-rated first) |
+| Matched (enriched) | 2,114 (99.0% of those tried; 21.7% of all movies) |
+| Not found | 22 (1.0% of those tried) |
+| Still pending | 7,606 (picked up on later daily runs) |
+| **Share of all ratings covered by enriched movies** | **78.7%** |
 
-**Query answers** (see `queries.sql`):
+That last number is why I enriched the popular movies first: only about a fifth of the movies have been enriched, but they account for almost 80% of all ratings.
 
-1. **Highest average rating:** *The Shawshank Redemption*, 4.43 average from 317 ratings (minimum 50 ratings required).
-2. **Top 5 genres by average rating:** Film-Noir (3.92), War (3.81), Documentary (3.80), Crime (3.66), Drama (3.66). Smaller genres like Film-Noir have fewer ratings (870) than Drama (41,928), so their averages are less certain.
-3. **Director with the most movies:** Steven Spielberg (17 movies). This is **provisional**: it is computed only from the 998 enriched movies and may change as enrichment continues.
-4. **Average rating per release year:** one row per year, starting in 1902. Early years have very few ratings (for example 1902 has 5 and 1917 has 1), so those averages are noisy, which is why `num_ratings` is shown.
+**Answers to the questions** (see `queries.sql`):
 
-Queries 1, 2 and 4 use only the CSV data, which is 100% loaded, so they are unaffected by API coverage.
+1. **Highest-rated movie:** *The Shawshank Redemption*, with an average of 4.43 from 317 ratings (minimum 50 ratings).
+2. **Top 5 genres by average rating:** Film-Noir (3.92), War (3.81), Documentary (3.80), Crime (3.66) and Drama (3.66). Film-Noir is a small genre (870 ratings, compared with 41,928 for Drama), so its average is less certain.
+3. **Director with the most movies:** Steven Spielberg, with 21 movies. This answer depends on the API data, so it only covers the 2,114 movies enriched so far and could change as more are added. Since those are the most popular movies, and the next director (Woody Allen) is at 17, I don't expect it to change.
+4. **Average rating per release year:** one row per year, from 1902 onward. The early years have very few ratings (1902 has 5, 1917 has just 1), so their averages are noisy. That's why the query also shows `num_ratings`.
 
-## Possible improvements and scaling
+Questions 1, 2 and 4 only use the CSV data, which is fully loaded, so the API coverage doesn't affect them.
 
-- **Orchestration:** schedule with Airflow or Prefect, with retries, alerting and incremental daily runs instead of manual re-runs.
-- **Database:** PostgreSQL or a cloud warehouse (Snowflake, BigQuery, Redshift) for larger data and concurrent users.
-- **API throughput:** async or parallel requests with rate limiting, a persistent response cache, or a paid OMDb tier to remove the daily cap.
-- **Data quality:** automated checks (for example Great Expectations) and unit tests with pytest for the cleaning functions.
-- **Reproducibility:** Docker image, configuration through environment variables, and structured logging and monitoring.
-- **Architecture:** store raw API responses and CSVs in object storage (S3) and layer the data (raw, cleaned, analytics-ready), so transformations can be re-run without re-calling the API.
-- **Scale:** process the larger MovieLens datasets in chunks, or with Spark, and add indexes or partitioning on the ratings table.
+## How I checked the results
+
+I didn't want to just trust the output of my own SQL, so I checked it a few different ways:
+
+- **Recomputed the answers separately.** I wrote a quick pandas script that works straight from the raw CSV files, without the database or any of the pipeline code. Its answers for questions 1, 2 and 4 matched the SQL results exactly, including all 106 years in question 4.
+- **Checked the edge cases.** The top two genres by rounding (Crime and Drama, both 3.66) are in the right order when you look at the unrounded values (3.658 vs 3.656), and Shawshank's lead in question 1 is clear (4.43 vs 4.29 for *The Godfather*).
+- **Spot-checked the API data.** For question 3, I went through the list of movies credited to Steven Spielberg, and all 21 are really his films. Checking directors like this is also how I found the wrong-film matches described in challenge 2.
+- **Rebuilt from scratch.** I ran the pipeline in an empty folder containing only the two CSV files, and then ran it a second time to confirm the row counts didn't change.
+
+## What I'd improve with more time
+
+- **Scheduling:** run the pipeline daily with Airflow or Prefect, with retries and alerts, instead of starting it by hand.
+- **Database:** move to PostgreSQL or a cloud warehouse (Snowflake) for bigger data and more users.
+- **API speed:** a paid OMDb tier to remove the daily cap, parallel requests with rate limiting, and a cache so no movie is ever requested twice.
+- **Layered storage:** keep the raw CSVs and API responses (for example in S3) separate from the cleaned data, so transformations can be re-run without calling the API again.
+- **Scale:** for the larger MovieLens datasets, process the data in chunks or with Spark, and add indexes or partitioning on the ratings table.

@@ -1,6 +1,6 @@
 """Movie data pipeline.
 
-Extracts MovieLens CSVs and OMDb API data, cleans/enriches them,
+Extracts the MovieLens movies.csv and ratings.csv files plus OMDb API data, cleans/enriches them,
 and loads the result into SQLite idempotently.
 
 Usage:
@@ -9,11 +9,13 @@ Usage:
     python etl.py                # full run (resumes where it stopped)
 """
 import argparse
+import difflib
 import logging
 import os
 import re
 import sqlite3
 import time
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +28,7 @@ DB_PATH = "movies.db"
 DATA_DIR = Path("data")
 SCHEMA_PATH = Path("schema.sql")
 OMDB_URL = "http://www.omdbapi.com/"
+MIN_VOTES = 1000      # a title+year hit with fewer IMDb votes is double-checked via search
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -61,25 +64,57 @@ def extract_csvs():
     return movies, ratings
 
 
-def load_imdb_links():
-    """Optional: map movieId -> IMDb id ('tt0114709') from links.csv."""
-    path = DATA_DIR / "links.csv"
-    if not path.exists():
-        log.info("links.csv not found; will match OMDb by title + year only")
-        return {}
-    links = pd.read_csv(path, dtype={"imdbId": str})
-    return {int(r.movieId): "tt" + str(r.imdbId).zfill(7)
-            for r in links.itertuples() if pd.notna(r.imdbId)}
-
-
 # ----------------------------------------------------------------------
 # TRANSFORM
 # ----------------------------------------------------------------------
+ARTICLES = r"The|A|An|Les|Le|La|L'|Das|Der|Die|El|Il|Los|Las|Un|Une"
+
+
+def move_article(title):
+    """'Usual Suspects, The' -> 'The Usual Suspects'; 'Boot, Das' -> 'Das Boot'."""
+    m = re.match(r"^(.*), ({})$".format(ARTICLES), title.strip())
+    if not m:
+        return title.strip()
+    sep = "" if m.group(2).endswith("'") else " "
+    return m.group(2) + sep + m.group(1)
+
+
 def fix_title(title):
-    """'Usual Suspects, The' -> 'The Usual Suspects'; drops a trailing '(Alt Title)'."""
-    title = re.sub(r"\s*\([^()]*\)$", "", title).strip()
-    m = re.match(r"^(.*), (The|A|An)$", title)
-    return "{} {}".format(m.group(2), m.group(1)) if m else title
+    """Main title: drops trailing '(Alt Title)' parts and moves the article to the front."""
+    title = title.strip()
+    while re.search(r"\S\s*\([^()]*\)$", title):        # keep a title that is only '(...)'
+        title = re.sub(r"\s*\([^()]*\)$", "", title).strip()
+    return move_article(title)
+
+
+def title_variants(title):
+    """Titles to try on OMDb, best first: main title, alternate titles from
+    the trailing '(...)' parts, then spelling variants, then shortened titles.
+
+    'Boot, Das (Boat, The)' -> ['Das Boot', 'The Boat']
+    "William Shakespeare's Romeo + Juliet" -> [..., 'Romeo + Juliet']
+    'Borat: Cultural Learnings of America ...' -> [..., 'Borat']
+    """
+    titles = [fix_title(title)]
+    rest = title.strip()
+    while re.search(r"\S\s*\([^()]*\)$", rest):
+        alt = re.search(r"\(([^()]*)\)$", rest).group(1)
+        titles.append(move_article(re.sub(r"^a\.k\.a\.\s*", "", alt)))
+        rest = rest[:rest.rfind("(")].strip()
+    for t in list(titles):
+        if " and " in t:
+            titles.append(t.replace(" and ", " & "))
+        if " & " in t:
+            titles.append(t.replace(" & ", " and "))
+        if t.startswith("Dr. "):
+            titles.append("Doctor " + t[4:])
+    main = titles[0]
+    m = re.match(r"^[A-Z]\w+ [A-Z]\w+'s (.+)$", main)        # "Bram Stoker's Dracula"
+    if m:
+        titles.append(m.group(1))
+    if ": " in main:                                          # title before the subtitle
+        titles.append(main.split(": ")[0])
+    return list(dict.fromkeys(t for t in titles if t))   # de-duplicate, keep order
 
 
 def transform_movies(df):
@@ -87,6 +122,7 @@ def transform_movies(df):
     df = df.drop_duplicates("movieId").copy()
     parts = df["title"].str.extract(r"^(.*)\s\((\d{4})\)\s*$")  # col 0 = title, col 1 = year
     df["clean_title"] = parts[0].fillna(df["title"]).apply(fix_title)
+    df["title_variants"] = parts[0].fillna(df["title"]).apply(title_variants)
     df["release_year"] = pd.to_numeric(parts[1], errors="coerce").astype("Int64")
     df["decade"] = (df["release_year"] // 10 * 10).astype("Int64")   # feature engineering
     df["genres"] = df["genres"].fillna("").replace("(no genres listed)", "")
@@ -97,7 +133,8 @@ def transform_movies(df):
 def transform_ratings(df, valid_movie_ids):
     """Drop bad rows and convert Unix timestamps to datetime strings."""
     before = len(df)
-    df = df.dropna().drop_duplicates(["userId", "movieId"]).copy()
+    df = (df.dropna().sort_values("timestamp")
+            .drop_duplicates(["userId", "movieId"], keep="last").copy())  # newest rating wins
     df = df[df["movieId"].isin(valid_movie_ids)]              # remove orphan ratings
     df = df[df["rating"].between(0.5, 5.0)]
     df["rated_at"] = (pd.to_datetime(df["timestamp"], unit="s")
@@ -109,21 +146,20 @@ def transform_ratings(df, valid_movie_ids):
 # ----------------------------------------------------------------------
 # LOAD (CSV data) - idempotent
 # ----------------------------------------------------------------------
-def load_movies(conn, df, imdb_map):
+def load_movies(conn, df):
     """Upsert movies. Does NOT overwrite OMDb-derived columns (plot, box_office, status)."""
     rows = []
     for r in df.itertuples():
         year = None if pd.isna(r.release_year) else int(r.release_year)
         decade = None if pd.isna(r.decade) else int(r.decade)
-        rows.append((int(r.movieId), r.clean_title, year, decade, imdb_map.get(int(r.movieId))))
+        rows.append((int(r.movieId), r.clean_title, year, decade))
     conn.executemany(
-        """INSERT INTO movies (movie_id, title, release_year, decade, imdb_id)
-           VALUES (?, ?, ?, ?, ?)
+        """INSERT INTO movies (movie_id, title, release_year, decade)
+           VALUES (?, ?, ?, ?)
            ON CONFLICT(movie_id) DO UPDATE SET
                title = excluded.title,
                release_year = excluded.release_year,
-               decade = excluded.decade,
-               imdb_id = COALESCE(movies.imdb_id, excluded.imdb_id)""",
+               decade = excluded.decade""",
         rows)
 
 
@@ -155,10 +191,9 @@ def load_ratings(conn, df):
 # ----------------------------------------------------------------------
 def call_omdb(session, params, retries=3):
     """One OMDb request. Returns (status, data); status is found / not_found / error."""
-    params = dict(params, apikey=API_KEY)
     for attempt in range(retries):
         try:
-            resp = session.get(OMDB_URL, params=params, timeout=10)
+            resp = session.get(OMDB_URL, params=dict(params, apikey=API_KEY), timeout=10)
             data = resp.json()
         except (requests.RequestException, ValueError):
             time.sleep(2 ** attempt)                  # backoff: 1s, 2s, 4s
@@ -170,25 +205,123 @@ def call_omdb(session, params, retries=3):
             raise DailyLimitReached()
         if "api key" in err:
             raise InvalidApiKey()
-        return "not_found", None
+        if "not found" in err:
+            return "not_found", None
+        log.warning("OMDb error for %s: %s", params, data.get("Error"))   # e.g. 'Error getting data.'
+        return "error", None
     return "error", None
 
 
-def lookup_movie(session, title, year, imdb_id):
-    """Try IMDb id, then title+year, then title alone. Returns (status, data)."""
-    attempts = []
-    if imdb_id:
-        attempts.append({"i": imdb_id})
-    if year:
-        attempts.append({"t": title, "y": year, "type": "movie"})
-    attempts.append({"t": title, "type": "movie"})
+def year_close(data, year, earlier=1, later=3):
+    """True if the OMDb 'Year' ('1995' or '2005-2010') is near the MovieLens year.
 
+    MovieLens uses the original release year, OMDb often the later US release
+    (Spirited Away: 2001 vs 2003), so the window is wider on the 'later' side.
+    A remake with the same title is usually much further away and is rejected.
+    """
+    m = re.match(r"\d{4}", data.get("Year") or "")
+    return year is None or (m is not None and -earlier <= int(m.group()) - year <= later)
+
+
+def normalize(title):
+    """'Amélie' -> 'amelie', 'Harold & Kumar' -> 'harold and kumar' (for comparing titles)."""
+    title = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode()
+    title = title.lower().replace("&", " and ")
+    return " ".join(re.sub(r"[^a-z0-9]+", " ", title).split())
+
+
+def title_matches(omdb_title, titles):
+    """True if OMDb's title is (nearly) one of our title variants.
+
+    Rejects OMDb's fuzzy near-misses such as 'Dr. Dolittle 2' for 'Dr. Dolittle'
+    (numbers differ) or 'The Boat Is Full' for 'The Boat' (too different).
+    """
+    a = normalize(omdb_title)
+    for t in titles:
+        b = normalize(t)
+        if a.replace(" ", "") == b.replace(" ", ""):              # 'Oldboy' vs 'Old Boy'
+            return True
+        if (re.findall(r"\d+", a) == re.findall(r"\d+", b)
+                and difflib.SequenceMatcher(None, a, b).ratio() >= 0.85):
+            return True
+    return False
+
+
+def imdb_votes(data):
+    """'1,234,567' -> 1234567; 0 if missing."""
+    digits = re.sub(r"[^\d]", "", data.get("imdbVotes") or "")
+    return int(digits) if digits else 0
+
+
+def search_candidates(session, query, titles, year):
+    """OMDb search results whose title matches and whose year is close.
+
+    Searches with the exact year first, then without it (OMDb may list the
+    later US release year). Returns (candidates, had_error).
+    """
+    for params in ([{"y": year}] if year else []) + [{}]:
+        status, data = call_omdb(session, dict(params, s=query, type="movie"))
+        if status == "error":
+            return [], True
+        hits = [h for h in (data or {}).get("Search", [])
+                if title_matches(h["Title"], titles) and year_close(h, year)]
+        if hits:
+            return hits, False
+    return [], False
+
+
+def lookup_movie(session, titles, year):
+    """Match a movie on OMDb using only its title(s) and year. Returns (status, data).
+
+    titles comes from title_variants(): main title first, then alternates.
+
+    OMDb's direct title lookup returns *some* entry with that title, not
+    necessarily the well-known film (e.g. a short or a making-of with the same
+    title and year). So:
+    1. title + year lookup: accepted straight away only if the title matches
+       and the entry is clearly the real film (>= MIN_VOTES IMDb votes).
+    2. title lookup without year (OMDb then returns the most popular entry,
+       which may carry the later US release year): same checks, year close.
+    3. otherwise OMDb search for each title variant: keep results whose title
+       matches and whose year is close, and pick the one with the lowest IMDb
+       id (the original film is almost always the oldest IMDb entry).
+    4. otherwise fall back to a weak step-1 result (an obscure but exact match).
+    Most movies match on the first call; extra calls are spent only on hard cases.
+    """
     had_error = False
-    for params in attempts:
-        status, data = call_omdb(session, params)
-        if status == "found":
-            return status, data
+    weak_match = None
+
+    if year:
+        for title in titles:
+            status, data = call_omdb(session, {"t": title, "y": year, "type": "movie"})
+            had_error = had_error or status == "error"
+            if status == "found" and title_matches(data.get("Title", ""), titles):
+                if imdb_votes(data) >= MIN_VOTES:
+                    return status, data
+                weak_match = weak_match or data
+                break
+
+    for title in titles:
+        status, data = call_omdb(session, {"t": title, "type": "movie"})
         had_error = had_error or status == "error"
+        if (status == "found" and title_matches(data.get("Title", ""), titles)
+                and year_close(data, year) and imdb_votes(data) >= MIN_VOTES):
+            return status, data
+
+    for title in titles:
+        hits, err = search_candidates(session, title, titles, year)
+        had_error = had_error or err
+        if hits:
+            best = min(hits, key=lambda h: int(re.sub(r"\D", "", h["imdbID"]) or 0))
+            if weak_match and weak_match.get("imdbID") == best["imdbID"]:
+                return "found", weak_match
+            status, data = call_omdb(session, {"i": best["imdbID"]})
+            if status == "found":
+                return status, data
+            had_error = had_error or status == "error"
+
+    if weak_match:
+        return "found", weak_match
     return ("error" if had_error else "not_found"), None
 
 
@@ -204,10 +337,12 @@ def parse_box_office(value):
     return int(digits) if digits else None
 
 
-def enrich_movies(conn, limit=None):
-    """Call OMDb for movies not yet processed. Safe to stop and re-run."""
+def enrich_movies(conn, variants, limit=None):
+    """Call OMDb for movies not yet processed. Safe to stop and re-run.
+
+    variants maps movie_id -> list of titles to try (from title_variants)."""
     rows = conn.execute(
-        """SELECT m.movie_id, m.title, m.release_year, m.imdb_id
+        """SELECT m.movie_id, m.title, m.release_year
            FROM movies m
            LEFT JOIN (SELECT movie_id, COUNT(*) AS n
                       FROM ratings GROUP BY movie_id) r ON r.movie_id = m.movie_id
@@ -220,10 +355,12 @@ def enrich_movies(conn, limit=None):
     session = requests.Session()
     counts = {"found": 0, "not_found": 0, "error": 0}
     try:
-        for i, (movie_id, title, year, imdb_id) in enumerate(rows, 1):
-            status, data = lookup_movie(session, title, year, imdb_id)
+        for i, (movie_id, title, year) in enumerate(rows, 1):
+            status, data = lookup_movie(session, variants.get(movie_id, [title]), year)
             counts[status] += 1
 
+            if status != "error":                     # re-matched: drop old directors
+                conn.execute("DELETE FROM movie_directors WHERE movie_id = ?", (movie_id,))
             if status == "found":
                 conn.execute(
                     """UPDATE movies SET imdb_id = ?, plot = ?, box_office = ?,
@@ -238,9 +375,13 @@ def enrich_movies(conn, limit=None):
                             """INSERT OR IGNORE INTO movie_directors (movie_id, director_id)
                                SELECT ?, director_id FROM directors WHERE name = ?""",
                             (movie_id, name))
+            elif status == "not_found":
+                conn.execute(
+                    """UPDATE movies SET imdb_id = NULL, plot = NULL, box_office = NULL,
+                              omdb_status = 'not_found' WHERE movie_id = ?""", (movie_id,))
             else:
-                conn.execute("UPDATE movies SET omdb_status = ? WHERE movie_id = ?",
-                             (status, movie_id))
+                conn.execute("UPDATE movies SET omdb_status = 'error' WHERE movie_id = ?",
+                             (movie_id,))
 
             if i % 50 == 0:
                 conn.commit()                         # save progress regularly
@@ -271,6 +412,8 @@ def main():
     parser = argparse.ArgumentParser(description="MovieLens + OMDb ETL pipeline")
     parser.add_argument("--limit", type=int, help="max movies to call the API for this run")
     parser.add_argument("--skip-api", action="store_true", help="load CSV data only")
+    parser.add_argument("--retry-not-found", action="store_true",
+                        help="try OMDb again for movies previously marked not_found")
     args = parser.parse_args()
 
     if not args.skip_api and not API_KEY:
@@ -282,13 +425,19 @@ def main():
     ratings = transform_ratings(ratings_raw, set(movies["movieId"]))
 
     with conn:                                        # one transaction; rolls back on error
-        load_movies(conn, movies, load_imdb_links())
+        load_movies(conn, movies)
         load_genres(conn, movies)
         load_ratings(conn, ratings)
     log.info("CSV data loaded")
 
     if not args.skip_api:
-        enrich_movies(conn, limit=args.limit)
+        if args.retry_not_found:
+            with conn:
+                n = conn.execute("UPDATE movies SET omdb_status = 'pending' "
+                                 "WHERE omdb_status = 'not_found'").rowcount
+            log.info("Retrying %d movies previously not found", n)
+        variants = dict(zip(movies["movieId"].tolist(), movies["title_variants"]))
+        enrich_movies(conn, variants, limit=args.limit)
 
     log_summary(conn)
     conn.close()
